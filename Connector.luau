@@ -8,6 +8,16 @@
         for name, value in pairs(_G) do
             if not _G.ExecutorAPI[name] then _G.ExecutorAPI[name] = value end
         end
+        -- Decompile: use getgenv().decompile when present (e.g. custom HTTP decompiler).
+        -- This wrapper lets you set getgenv().decompile before OR after the connector runs.
+        _G.ExecutorAPI.decompile = function(scr)
+            local g = getgenv and getgenv()
+            local d = g and g.decompile
+            if type(d) ~= "function" then
+                error("decompile not available (set getgenv().decompile or use an executor that provides it)")
+            end
+            return d(scr)
+        end
         _G.ExecutorAPI._initialized = true
     end
 
@@ -33,7 +43,23 @@
         if g and g.BridgeURL then return g.BridgeURL end
         return "localhost:16384"
     end)()
-    local LuaEncode = loadstring(game:HttpGet("https://raw.githubusercontent.com/chadhyatt/LuaEncode/refs/heads/master/src/LuaEncode.lua"))()
+    local BridgeSecret = (function()
+        local g = getgenv and getgenv()
+        if g and g.BridgeSecret and type(g.BridgeSecret) == "string" then return g.BridgeSecret end
+        return nil
+    end)()
+    local LuaEncode
+    do
+        local ok, fn = pcall(function()
+            return loadstring(game:HttpGet("https://raw.githubusercontent.com/chadhyatt/LuaEncode/refs/heads/master/src/LuaEncode.lua"))()
+        end)
+        if ok and type(fn) == "function" then
+            LuaEncode = fn
+        else
+            LuaEncode = nil
+            warn("[Roblox MCP connector] LuaEncode load failed; responses will use JSONEncode fallback.")
+        end
+    end
     local cloneref = cloneref or function(x) return x end
     local getnilinstances = getnilinstances or function() return {} end
 
@@ -84,11 +110,11 @@
             if typeof(output) ~= "table" then
                 output = { output }
             end
+
+            local encoded = HttpService:JSONEncode(output)
         
             return {
-                output = LuaEncode(output, {
-                    Prettify = true
-                }),
+                output = encoded,
                 success = true,
                 id = id
             }
@@ -141,6 +167,11 @@
             self.WebSocket = WebSocket.connect("ws://" .. BridgeURL)
             self.Connected = true
             self.Callbacks = {}
+            if BridgeSecret and BridgeSecret ~= "" then
+                pcall(function()
+                    self.WebSocket:Send(HttpService:JSONEncode({ type = "auth", secret = BridgeSecret }))
+                end)
+            end
             self.AliveThread = task.spawn(function()
                 while task.wait(1) do
                     if self:IsAlive() or not self.Connected then
@@ -196,9 +227,14 @@
                 
                 while self.Connected do
                     local success, _ = pcall(function()
+                        local headers = {}
+                        if BridgeSecret and BridgeSecret ~= "" then
+                            headers["X-Bridge-Secret"] = BridgeSecret
+                        end
                         local response = request({
                             Url = "http://" .. BridgeURL .. "/poll",
-                            Method = "GET"
+                            Method = "GET",
+                            Headers = next(headers) and headers or nil
                         })
 
                         if response.StatusCode ~= 204 and response.StatusCode ~= 200 then
@@ -219,12 +255,14 @@
                             local result = self:HandleMessage(data)
                             if result == nil then return end
                             
+                            local respondHeaders = { ["Content-Type"] = "application/json" }
+                            if BridgeSecret and BridgeSecret ~= "" then
+                                respondHeaders["X-Bridge-Secret"] = BridgeSecret
+                            end
                             request({
                                 Url = "http://" .. BridgeURL .. "/respond",
                                 Method = "POST",
-                                Headers = {
-                                    ["Content-Type"] = "application/json"
-                                },
+                                Headers = respondHeaders,
                                 Body = HttpService:JSONEncode(result)
                             })
                         end
@@ -269,7 +307,15 @@
         local Bridge = CreateBridge()
 
         Bridge:BindToType("execute", function(data)
-            local fn, err = loadstring(data.source)
+            -- Guard: loadstring expects a string; avoid "string expected, got Instance" from bad payloads.
+            if data.source == nil then
+                return { error = "execute: source is required" }
+            end
+            if type(data.source) ~= "string" then
+                return { error = "execute: source must be a string, got " .. type(data.source) }
+            end
+            local src = data.source
+            local fn, err = loadstring(src)
             if not fn then
                 return { error = "Failed to compile code: " .. tostring(err) }
             end
@@ -323,29 +369,61 @@
         end)
 
         Bridge:BindToType("get-data-by-code", function(data)
-            local fn, err = loadstring(data.source)
+            if data.source == nil then
+                return { error = "get-data-by-code: source is required" }
+            end
+            if type(data.source) ~= "string" then
+                return { error = "get-data-by-code: source must be a string, got " .. type(data.source) }
+            end
+            local src = data.source
+            local fn, err = loadstring(src)
             if not fn then
                 return { error = "Failed to compile code: " .. tostring(err) }
             end
             if setfenv then setfenv(fn, execEnv) end
-            local dataOutput = table.pack(pcall(fn))
-            local success = dataOutput[1]
-            table.remove(dataOutput, 1) -- pcall prepends success; strip for serialization
-
-            if not success then
-                return { error = dataOutput[1] or "Unknown error during execution" }
+            local ok, result = pcall(fn)
+            if not ok then
+                return { error = result or "Unknown error during execution" }
             end
-
-            return dataOutput
+            return result
         end)
 
         Bridge:BindToType("search-instances", function(data)
-            local rootInstance = loadstring("return " .. data.root)()
-            local instances = rootInstance:QueryDescendants(data.selector)
-            
+            local rootInstance
+            if type(data.rootParts) == "table" and #data.rootParts > 0 then
+                -- Path-walk from game (avoids loadstring; supports Players.LocalPlayer)
+                local inst = game
+                for _, p in ipairs(data.rootParts) do
+                    if inst.ClassName == "Players" and p == "LocalPlayer" then
+                        inst = inst.LocalPlayer
+                    elseif inst.ClassName == "Player" and p == "Character" then
+                        inst = inst.Character
+                    else
+                        inst = inst:FindFirstChild(p)
+                    end
+                    if not inst then
+                        return { error = "Root not found (path walk)", success = false }
+                    end
+                end
+                rootInstance = inst
+            else
+                local ok, res = pcall(function()
+                    return loadstring("return " .. (data.root or "game"))()
+                end)
+                if not ok or not res then
+                    return { error = "Root not found or invalid root expression: " .. tostring(data.root or "game"), success = false }
+                end
+                rootInstance = res
+            end
+            local ok, instances = pcall(function()
+                return rootInstance:QueryDescendants(data.selector or "")
+            end)
+            if not ok or not instances then
+                return { error = "QueryDescendants failed: " .. tostring(instances), success = false }
+            end
             local limit = data.limit or 50
             local results = {}
-            
+
             for i, instance in ipairs(instances) do
                 if i > limit then break end
 
@@ -353,10 +431,11 @@
                     Name = instance.Name,
                     ClassName = instance.ClassName,
                     InstancePath = instance,
+                    path = instance:GetFullName(),
                     DebugId = instance:GetDebugId()
                 })
             end
-            
+
             return {
                 count = #instances,
                 limited = #instances > limit,
@@ -365,19 +444,31 @@
         end)
 
         Bridge:BindToType("get-game-info", function(data)
-            local productInfo = MarketplaceService:GetProductInfo(game.PlaceId)
-            
+            local productInfo
+            local okProduct, errProduct = pcall(function()
+                productInfo = MarketplaceService:GetProductInfo(game.PlaceId)
+            end)
+            if not okProduct or not productInfo then
+                return { error = "GetProductInfo failed: " .. tostring(errProduct or "unknown") }
+            end
+            local serverType = "Unknown"
+            local okServer, st = pcall(function()
+                return RobloxReplicatedStorage.GetServerType:InvokeServer()
+            end)
+            if okServer and st ~= nil then serverType = tostring(st) end
+            local creator = productInfo.Creator or {}
+            local creatorId = creator.Id or creator.CreatorTargetId
             return {
                 PlaceId = game.PlaceId,
                 GameId = game.GameId,
                 PlaceVersion = game.PlaceVersion,
                 PlaceName = productInfo.Name,
                 PlaceDescription = productInfo.Description,
-                Creator = productInfo.Creator.Name,
-                CreatorType = tostring(productInfo.Creator.CreatorType),
-                CreatorId = productInfo.Creator.CreatorTargetId,
+                Creator = creator.Name or "",
+                CreatorType = tostring(creator.CreatorType or ""),
+                CreatorId = creatorId,
                 JobId = game.JobId,
-                ServerType = RobloxReplicatedStorage.GetServerType:InvokeServer()
+                ServerType = serverType
             }
         end)
 
